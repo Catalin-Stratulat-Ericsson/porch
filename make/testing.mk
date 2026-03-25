@@ -70,6 +70,13 @@ test-e2e-cli-db-cache: ## Run cli end-to-end tests with db-cache
 test-e2e-cli-db-cache: run-in-kind-db-cache-no-git
 	E2E=1 go test -v -failfast ./test/e2e/cli
 
+.PHONY: test-e2e-cli-compat
+test-e2e-cli-compat: ## Run cli e2e tests with a custom porchctl binary (set PORCHCTL_PATH)
+ifndef PORCHCTL_PATH
+	$(error PORCHCTL_PATH is not set. Usage: make test-e2e-cli-compat PORCHCTL_PATH=/path/to/older/porchctl)
+endif
+	E2E=1 PORCHCTL_PATH=$(PORCHCTL_PATH) go test -v -failfast ./test/e2e/cli
+
 .PHONY: test-e2e-clean
 test-e2e-clean: porchctl ## Run end-to-end tests against a newly deployed porch in a newly created kind cluster
 	./scripts/clean-e2e-test.sh

@@ -62,9 +62,16 @@ func NewCliTestSuite(t *testing.T, testdataDir string) *CliTestSuite {
 		t.Fatalf("Failed to get absolute path to testdata directory: %v", err)
 	}
 	// find porchctl to test
-	s.PorchctlCommand, err = filepath.Abs(filepath.Join("..", "..", "..", ".build", "porchctl"))
-	if err != nil {
-		t.Fatalf("Failed to get absolute path to .build/porchctl command: %v", err)
+	if customPath := os.Getenv("PORCHCTL_PATH"); customPath != "" {
+		s.PorchctlCommand, err = filepath.Abs(customPath)
+		if err != nil {
+			t.Fatalf("Failed to get absolute path to PORCHCTL_PATH %q: %v", customPath, err)
+		}
+	} else {
+		s.PorchctlCommand, err = filepath.Abs(filepath.Join("..", "..", "..", ".build", "porchctl"))
+		if err != nil {
+			t.Fatalf("Failed to get absolute path to .build/porchctl command: %v", err)
+		}
 	}
 	if _, err := os.Stat(s.PorchctlCommand); err != nil {
 		t.Fatalf("porchctl command not found at %q: %v", s.PorchctlCommand, err)

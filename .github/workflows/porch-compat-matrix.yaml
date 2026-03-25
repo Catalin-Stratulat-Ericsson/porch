@@ -1,0 +1,459 @@
+# Copyright 2026 The Nephio Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CLI Compatibility Matrix
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1" # Every Monday at 8AM UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: porch-kind
+  KIND_CONTEXT_NAME: porch-test
+  PORCH_SERVER_IMAGE: porch-server
+  PORCH_CONTROLLERS_IMAGE: porch-controllers
+  PORCH_FUNCTION_RUNNER_IMAGE: porch-function-runner
+  PORCH_WRAPPER_SERVER_IMAGE: porch-wrapper-server
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve the last 3 published releases and build the test matrix
+  # ---------------------------------------------------------------------------
+  resolve-versions:
+    name: Resolve Versions
+    runs-on: ubuntu-latest
+    outputs:
+      releases: ${{ steps.releases.outputs.versions }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Get last 3 releases
+        id: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: nephio-project/porch
+        run: |
+          # Always query upstream repo for releases (works correctly from forks)
+          VERSIONS=$(gh api repos/${UPSTREAM_REPO}/releases \
+            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:3] | [.[].tag_name]')
+          echo "versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
+          echo "Resolved releases: ${VERSIONS}"
+
+      - name: Build compatibility matrix
+        id: matrix
+        run: |
+          RELEASES='${{ steps.releases.outputs.versions }}'
+
+          # Server versions: latest (from branch) + last 3 releases, each with CR and DB cache
+          # CLI versions: latest (from branch) + last 3 releases
+          MATRIX=$(cat <<'SCRIPT' | python3 - "${RELEASES}"
+          import json, sys
+          releases = json.loads(sys.argv[1])
+          server_versions = ["latest"] + releases
+          cli_versions = ["latest"] + releases
+          cache_types = ["CR", "DB"]
+          includes = []
+          for sv in server_versions:
+              for cache in cache_types:
+                  for cv in cli_versions:
+                      includes.append({
+                          "server_version": sv,
+                          "cache_type": cache,
+                          "cli_version": cv
+                      })
+          print(json.dumps({"include": includes}))
+          SCRIPT
+          )
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${MATRIX}" | python3 -m json.tool
+
+  # ---------------------------------------------------------------------------
+  # 2. Build the latest server images from the current branch
+  # ---------------------------------------------------------------------------
+  build-latest-server:
+    name: Build Latest Server Images
+    runs-on: ubuntu-latest
+    needs: resolve-versions
+    timeout-minutes: 15
+    env:
+      IMAGE_TAG: latest
+    steps:
+      - name: Checkout Porch
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-kpt
+        with:
+          install-kpt: "false"
+          go-cache: "true"
+      - name: Build images
+        run: |
+          set -e
+          IMAGE_NAME=${PORCH_FUNCTION_RUNNER_IMAGE} WRAPPER_SERVER_IMAGE_NAME=${PORCH_WRAPPER_SERVER_IMAGE} make -C func/ build-image &
+          pid1=$!
+          IMAGE_NAME=${PORCH_SERVER_IMAGE} make -C build/ build-image &
+          pid2=$!
+          IMAGE_NAME=${PORCH_CONTROLLERS_IMAGE} make -C controllers/ build-image &
+          pid3=$!
+          wait $pid1 && wait $pid2 && wait $pid3
+      - name: Save images
+        run: |
+          docker save \
+            ${IMAGE_REPO}/${PORCH_SERVER_IMAGE}:${IMAGE_TAG} \
+            ${IMAGE_REPO}/${PORCH_CONTROLLERS_IMAGE}:${IMAGE_TAG} \
+            ${IMAGE_REPO}/${PORCH_FUNCTION_RUNNER_IMAGE}:${IMAGE_TAG} \
+            ${IMAGE_REPO}/${PORCH_WRAPPER_SERVER_IMAGE}:${IMAGE_TAG} \
+            | gzip > porch-images-latest.tar.gz
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: porch-images-latest
+          path: porch-images-latest.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 3. Build the latest porchctl from the current branch
+  # ---------------------------------------------------------------------------
+  build-latest-cli:
+    name: Build Latest CLI
+    runs-on: ubuntu-latest
+    needs: resolve-versions
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Porch
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-kpt
+        with:
+          install-kpt: "false"
+          go-cache: "true"
+      - name: Build porchctl
+        run: make porchctl
+      - name: Upload porchctl
+        uses: actions/upload-artifact@v4
+        with:
+          name: porchctl-latest
+          path: .build/porchctl
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 4. Run each combination in the compatibility matrix
+  # ---------------------------------------------------------------------------
+  compat-test:
+    name: "Server ${{ matrix.server_version }} (${{ matrix.cache_type }}) / CLI ${{ matrix.cli_version }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [resolve-versions, build-latest-server, build-latest-cli]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve-versions.outputs.matrix) }}
+    steps:
+      - name: Checkout Porch
+        uses: actions/checkout@v4
+
+      - name: Set up Go and kpt
+        uses: ./.github/actions/setup-go-kpt
+        with:
+          go-cache: "true"
+
+      - name: Install Kind
+        uses: helm/kind-action@v1
+        with:
+          version: v0.30.0
+          install_only: true
+
+      - name: Set up Git config
+        run: |
+          git config --global user.name "Porch Compat"
+          git config --global user.email "porch-compat@porch.dev"
+
+      - name: Setup dev env (kind + gitea + MetalLB)
+        run: ${GITHUB_WORKSPACE}/scripts/setup-dev-env.sh
+
+      # --- Deploy the server ---
+
+      - name: Deploy server (latest from branch)
+        if: matrix.server_version == 'latest'
+        run: |
+          # Download pre-built latest images
+          echo "Loading latest server images built from branch..."
+      - name: Download latest server images
+        if: matrix.server_version == 'latest'
+        uses: actions/download-artifact@v4
+        with:
+          name: porch-images-latest
+      - name: Load and deploy latest server
+        if: matrix.server_version == 'latest'
+        run: |
+          gunzip -c porch-images-latest.tar.gz | docker load
+          kind load docker-image ${IMAGE_REPO}/${PORCH_SERVER_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
+          kind load docker-image ${IMAGE_REPO}/${PORCH_CONTROLLERS_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
+          kind load docker-image ${IMAGE_REPO}/${PORCH_FUNCTION_RUNNER_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
+          kind load docker-image ${IMAGE_REPO}/${PORCH_WRAPPER_SERVER_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
+          IMAGE_TAG=latest SKIP_IMG_BUILD=true SKIP_LOCAL_GIT=true \
+            PORCH_CACHE_TYPE=${{ matrix.cache_type }} \
+            make deployment-config deploy-current-config
+
+      - name: Deploy released server ${{ matrix.server_version }}
+        if: matrix.server_version != 'latest'
+        env:
+          SERVER_VERSION: ${{ matrix.server_version }}
+          CACHE_TYPE: ${{ matrix.cache_type }}
+        run: |
+          set -e
+          DEPLOY_DIR="${GITHUB_WORKSPACE}/.build/deploy"
+          rm -rf "${DEPLOY_DIR}" || true
+          mkdir -p "${DEPLOY_DIR}"
+
+          # Download and extract the release blueprint
+          UPSTREAM_REPO="nephio-project/porch"
+          BLUEPRINT_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${SERVER_VERSION}/porch_blueprint.tar.gz"
+          echo "Downloading blueprint from ${BLUEPRINT_URL}"
+          curl -fsSL "${BLUEPRINT_URL}" | tar -xz -C "${DEPLOY_DIR}"
+
+          # Pull server images from registry and load into kind
+          VERSION_NUM="${SERVER_VERSION#v}"
+          for IMG in porch-server porch-controllers porch-function-runner porch-wrapper-server; do
+            echo "Pulling docker.io/nephio/${IMG}:${SERVER_VERSION}"
+            docker pull "docker.io/nephio/${IMG}:${SERVER_VERSION}" || true
+            kind load docker-image "docker.io/nephio/${IMG}:${SERVER_VERSION}" -n ${KIND_CONTEXT_NAME} || true
+          done
+
+          # Configure cache type if DB
+          if [ "${CACHE_TYPE}" = "DB" ]; then
+            # Use kpt to switch cache type to DB
+            kpt fn eval "${DEPLOY_DIR}" \
+              --image ghcr.io/kptdev/krm-functions-catalog/search-replace:v0.2 \
+              --match-kind ConfigMap \
+              --match-name porch-config \
+              --match-namespace porch-system \
+              -- by-path=data.cache-type put-value="DB" || true
+          else
+            # For CR cache, remove postgres resources and update config
+            rm -f "${DEPLOY_DIR}"/*porch-postgres*.yaml 2>/dev/null || true
+            kpt fn eval "${DEPLOY_DIR}" \
+              --image ghcr.io/kptdev/krm-functions-catalog/search-replace:v0.2 \
+              --match-kind ConfigMap \
+              --match-name porch-config \
+              --match-namespace porch-system \
+              -- by-path=data.cache-type put-value="CR" || true
+          fi
+
+          # Deploy using kpt
+          kpt live init "${DEPLOY_DIR}" --name porch --namespace porch-system --inventory-id nephio || true
+          kpt live apply --inventory-policy=adopt --server-side --force-conflicts "${DEPLOY_DIR}"
+          kubectl rollout status deployment function-runner --namespace porch-system --timeout=120s 2>/dev/null || true
+          kubectl rollout status deployment porch-controllers --namespace porch-system --timeout=120s 2>/dev/null || true
+          kubectl rollout status deployment porch-server --namespace porch-system --timeout=120s 2>/dev/null || true
+          echo "Server ${SERVER_VERSION} (${CACHE_TYPE}) deployed."
+
+      # --- Obtain the CLI ---
+
+      - name: Download latest CLI
+        if: matrix.cli_version == 'latest'
+        uses: actions/download-artifact@v4
+        with:
+          name: porchctl-latest
+          path: .build/
+      - name: Make latest CLI executable
+        if: matrix.cli_version == 'latest'
+        run: chmod +x .build/porchctl
+
+      - name: Download released CLI ${{ matrix.cli_version }}
+        if: matrix.cli_version != 'latest'
+        env:
+          CLI_VERSION: ${{ matrix.cli_version }}
+        run: |
+          VERSION_NUM="${CLI_VERSION#v}"
+          UPSTREAM_REPO="nephio-project/porch"
+          CLI_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${CLI_VERSION}/porchctl_${VERSION_NUM}_linux_amd64.tar.gz"
+          echo "Downloading porchctl from ${CLI_URL}"
+          mkdir -p .build
+          curl -fsSL "${CLI_URL}" | tar -xz -C .build/
+          chmod +x .build/porchctl
+          .build/porchctl version || echo "porchctl version check done"
+
+      # --- Run CLI tests ---
+
+      - name: Run CLI E2E tests
+        id: run-tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          E2E=1 PORCHCTL_PATH="${GITHUB_WORKSPACE}/.build/porchctl" \
+            go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee test-output.log
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Parse test results
+        if: always()
+        id: parse
+        run: |
+          set +e
+          # Extract individual test results
+          RESULT="pass"
+          FAILED_TESTS=""
+
+          if [ "${{ steps.run-tests.outcome }}" = "failure" ]; then
+            RESULT="fail"
+            # Extract failed test names from output
+            FAILED_TESTS=$(grep -E '^\s*--- FAIL:' test-output.log | sed 's/.*--- FAIL: //' | sed 's/ (.*//' | tr '\n' ',' | sed 's/,$//')
+          fi
+
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+          echo "failed_tests=${FAILED_TESTS}" >> "$GITHUB_OUTPUT"
+          echo "Test result: ${RESULT}"
+          echo "Failed tests: ${FAILED_TESTS}"
+
+      - name: Upload test result artifact
+        if: always()
+        run: |
+          mkdir -p .build/compat-results
+          cat > .build/compat-results/result.json <<EOF
+          {
+            "server_version": "${{ matrix.server_version }}",
+            "cache_type": "${{ matrix.cache_type }}",
+            "cli_version": "${{ matrix.cli_version }}",
+            "result": "${{ steps.parse.outputs.result }}",
+            "failed_tests": "${{ steps.parse.outputs.failed_tests }}"
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "compat-result-${{ matrix.server_version }}-${{ matrix.cache_type }}-${{ matrix.cli_version }}"
+          path: .build/compat-results/result.json
+          retention-days: 5
+
+      - name: Export porch server logs
+        if: always()
+        run: |
+          name=$(kubectl -n porch-system get pod -l app=porch-server -o custom-columns=NAME:.metadata.name --no-headers=true 2>/dev/null || echo "")
+          if [ -n "$name" ]; then
+            kubectl -n porch-system logs "$name" > server.log 2>/dev/null || true
+          fi
+      - name: Archive server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "server-log-${{ matrix.server_version }}-${{ matrix.cache_type }}-${{ matrix.cli_version }}"
+          path: server.log
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 5. Aggregate results into a compatibility matrix summary
+  # ---------------------------------------------------------------------------
+  compat-summary:
+    name: Compatibility Matrix Summary
+    if: always()
+    needs: [resolve-versions, compat-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: compat-result-*
+          path: results/
+
+      - name: Generate compatibility matrix
+        run: |
+          RELEASES='${{ needs.resolve-versions.outputs.releases }}'
+
+          cat > generate_matrix.py <<'PYEOF'
+          import json, glob, sys, os
+
+          releases = json.loads(sys.argv[1])
+          cli_versions = ["latest"] + releases
+          server_versions = ["latest"] + releases
+          cache_types = ["CR", "DB"]
+
+          # Load all results
+          results = {}
+          for f in glob.glob("results/**/result.json", recursive=True):
+              with open(f) as fh:
+                  r = json.load(fh)
+              key = (r["server_version"], r["cache_type"], r["cli_version"])
+              results[key] = r
+
+          # Build markdown table
+          # Header row
+          header = "| Server ↓ \\ CLI → |"
+          separator = "|---|"
+          for cv in cli_versions:
+              header += f" {cv} |"
+              separator += "---|"
+
+          lines = [header, separator]
+
+          for sv in server_versions:
+              for cache in cache_types:
+                  row = f"| {sv} ({cache}) |"
+                  for cv in cli_versions:
+                      key = (sv, cache, cv)
+                      r = results.get(key)
+                      if r is None:
+                          row += " ⚪ N/A |"
+                      elif r["result"] == "pass":
+                          row += " ✅ |"
+                      else:
+                          failed = r.get("failed_tests", "")
+                          if failed:
+                              # Show failed test names
+                              tests = failed.split(",")
+                              short = ", ".join(t.split("/")[-1] if "/" in t else t for t in tests[:3])
+                              if len(tests) > 3:
+                                  short += f" +{len(tests)-3} more"
+                              row += f" ❌ {short} |"
+                          else:
+                              row += " ❌ |"
+                  lines.append(row)
+
+          table = "\n".join(lines)
+
+          # Write to GitHub step summary
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          with open(summary_file, "a") as f:
+              f.write("## CLI Compatibility Matrix\n\n")
+              f.write(table + "\n\n")
+              f.write("- ✅ = All CLI tests passed\n")
+              f.write("- ❌ = One or more tests failed (failed test names shown)\n")
+              f.write("- ⚪ = Test did not run\n")
+
+          # Also print to stdout
+          print(table)
+
+          # Determine overall status
+          any_fail = any(r["result"] == "fail" for r in results.values())
+          if any_fail:
+              print("\n⚠️  Some compatibility tests failed!")
+          else:
+              print("\n✅ All compatibility tests passed!")
+          PYEOF
+
+          python3 generate_matrix.py "${RELEASES}"
+
+      - name: Check for failures
+        run: |
+          # Fail the workflow if any test failed
+          FAILED=$(find results/ -name result.json -exec grep -l '"result": "fail"' {} \;)
+          if [ -n "$FAILED" ]; then
+            echo "::error::Some compatibility tests failed. See the matrix summary above."
+            exit 1
+          fi
