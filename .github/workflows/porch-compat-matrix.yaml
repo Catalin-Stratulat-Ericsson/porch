@@ -60,7 +60,7 @@ jobs:
         run: |
           RELEASES='${{ steps.releases.outputs.versions }}'
           MATRIX=$(echo "$RELEASES" | jq -c '
-            ["latest"] + . as $versions |
+            (["latest"] + .) as $versions |
             ["CR", "DB"] as $caches |
             {include: [
               $versions[] as $sv |
