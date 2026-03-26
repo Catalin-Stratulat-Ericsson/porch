@@ -57,29 +57,26 @@ jobs:
 
       - name: Build compatibility matrix
         id: matrix
+        env:
+          RELEASES: ${{ steps.releases.outputs.versions }}
         run: |
-          RELEASES='${{ steps.releases.outputs.versions }}'
-
-          # Server versions: latest (from branch) + last 3 releases, each with CR and DB cache
-          # CLI versions: latest (from branch) + last 3 releases
-          MATRIX=$(cat <<'SCRIPT' | python3 - "${RELEASES}"
-          import json, sys
-          releases = json.loads(sys.argv[1])
-          server_versions = ["latest"] + releases
-          cli_versions = ["latest"] + releases
-          cache_types = ["CR", "DB"]
+          MATRIX=$(python3 -c "
+          import json, os
+          releases = json.loads(os.environ['RELEASES'])
+          server_versions = ['latest'] + releases
+          cli_versions = ['latest'] + releases
+          cache_types = ['CR', 'DB']
           includes = []
           for sv in server_versions:
               for cache in cache_types:
                   for cv in cli_versions:
                       includes.append({
-                          "server_version": sv,
-                          "cache_type": cache,
-                          "cli_version": cv
+                          'server_version': sv,
+                          'cache_type': cache,
+                          'cli_version': cv
                       })
-          print(json.dumps({"include": includes}))
-          SCRIPT
-          )
+          print(json.dumps({'include': includes}))
+          ")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
           echo "Matrix: ${MATRIX}" | python3 -m json.tool
 

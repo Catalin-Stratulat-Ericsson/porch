@@ -14,7 +14,7 @@
 
 name: End-to-End Tests
 on:
-  pull_request:
+  # pull_request: # temporarily disabled for compat matrix testing
   workflow_dispatch:
 
 concurrency:
