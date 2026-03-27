@@ -274,10 +274,11 @@ jobs:
           # Build list of CLI versions to test: latest + releases
           CLI_VERSIONS="latest $(echo "$RELEASES" | jq -r '.[]')"
 
-          # Back up the current branch's testdata (used for "latest" CLI)
-          TESTDATA_DIR="${GITHUB_WORKSPACE}/test/e2e/cli/testdata"
-          TESTDATA_BACKUP="${GITHUB_WORKSPACE}/.build/testdata-backup"
-          cp -r "${TESTDATA_DIR}" "${TESTDATA_BACKUP}"
+          # Back up the current branch's test/e2e/cli directory and .build/porchctl
+          CLI_TEST_DIR="${GITHUB_WORKSPACE}/test/e2e/cli"
+          CLI_TEST_BACKUP="${GITHUB_WORKSPACE}/.build/cli-test-backup"
+          cp -r "${CLI_TEST_DIR}" "${CLI_TEST_BACKUP}"
+          PORCHCTL_ORIGINAL="${GITHUB_WORKSPACE}/.build/porchctl"
 
           UPSTREAM_REPO="nephio-project/porch"
 
@@ -287,37 +288,47 @@ jobs:
             echo "Testing CLI ${CLI_VERSION} against server ${{ matrix.server_version }}"
             echo "=============================================="
 
-            # --- Swap testdata to match the CLI version's golden files ---
             if [ "${CLI_VERSION}" = "latest" ]; then
-              echo "[TESTDATA] Using current branch testdata (latest)"
-              rm -rf "${TESTDATA_DIR}"
-              cp -r "${TESTDATA_BACKUP}" "${TESTDATA_DIR}"
+              # --- Latest: use current branch test code + PORCHCTL_PATH ---
+              echo "[TEST CODE] Using current branch test code (latest)"
+              rm -rf "${CLI_TEST_DIR}"
+              cp -r "${CLI_TEST_BACKUP}" "${CLI_TEST_DIR}"
+
+              PORCHCTL_BIN="${GITHUB_WORKSPACE}/.build/cli/${CLI_VERSION}/porchctl"
+              LOG_FILE=".build/compat-results/test-${CLI_VERSION}.log"
+
+              E2E=1 PORCHCTL_PATH="${PORCHCTL_BIN}" \
+                go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee "${LOG_FILE}"
+              TEST_EXIT=${PIPESTATUS[0]}
             else
-              echo "[TESTDATA] Downloading testdata from upstream tag ${CLI_VERSION}..."
+              # --- Released version: swap entire test/e2e/cli from upstream tag ---
+              echo "[TEST CODE] Downloading test code from upstream tag ${CLI_VERSION}..."
               TARBALL_URL="https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${CLI_VERSION}.tar.gz"
               EXTRACT_DIR=$(mktemp -d)
               curl -fsSL "${TARBALL_URL}" | tar -xz -C "${EXTRACT_DIR}"
-              # The tarball extracts to porch-<version-without-v>/
               VERSION_NUM="${CLI_VERSION#v}"
-              EXTRACTED_TESTDATA="${EXTRACT_DIR}/porch-${VERSION_NUM}/test/e2e/cli/testdata"
-              if [ -d "${EXTRACTED_TESTDATA}" ]; then
-                rm -rf "${TESTDATA_DIR}"
-                cp -r "${EXTRACTED_TESTDATA}" "${TESTDATA_DIR}"
-                echo "[TESTDATA] Swapped testdata to ${CLI_VERSION} golden files"
+              EXTRACTED_CLI_TEST="${EXTRACT_DIR}/porch-${VERSION_NUM}/test/e2e/cli"
+
+              if [ -d "${EXTRACTED_CLI_TEST}" ]; then
+                rm -rf "${CLI_TEST_DIR}"
+                cp -r "${EXTRACTED_CLI_TEST}" "${CLI_TEST_DIR}"
+                echo "[TEST CODE] Swapped to ${CLI_VERSION} test code + testdata"
               else
-                echo "[TESTDATA] WARNING: Could not find testdata in ${CLI_VERSION} source, using current branch testdata"
-                rm -rf "${TESTDATA_DIR}"
-                cp -r "${TESTDATA_BACKUP}" "${TESTDATA_DIR}"
+                echo "[TEST CODE] WARNING: Could not find test/e2e/cli in ${CLI_VERSION} source, falling back to current branch"
+                rm -rf "${CLI_TEST_DIR}"
+                cp -r "${CLI_TEST_BACKUP}" "${CLI_TEST_DIR}"
               fi
               rm -rf "${EXTRACT_DIR}"
+
+              # Copy the porchctl binary to .build/porchctl where the old harness expects it
+              cp "${GITHUB_WORKSPACE}/.build/cli/${CLI_VERSION}/porchctl" "${PORCHCTL_ORIGINAL}"
+              echo "[TEST CODE] Placed ${CLI_VERSION} porchctl at .build/porchctl"
+
+              LOG_FILE=".build/compat-results/test-${CLI_VERSION}.log"
+
+              E2E=1 go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee "${LOG_FILE}"
+              TEST_EXIT=${PIPESTATUS[0]}
             fi
-
-            PORCHCTL_BIN="${GITHUB_WORKSPACE}/.build/cli/${CLI_VERSION}/porchctl"
-            LOG_FILE=".build/compat-results/test-${CLI_VERSION}.log"
-
-            E2E=1 PORCHCTL_PATH="${PORCHCTL_BIN}" \
-              go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee "${LOG_FILE}"
-            TEST_EXIT=${PIPESTATUS[0]}
 
             # Parse results
             RESULT="pass"
@@ -341,10 +352,10 @@ jobs:
             echo "Failed tests: ${FAILED_TESTS}"
           done
 
-          # Restore original testdata
-          rm -rf "${TESTDATA_DIR}"
-          cp -r "${TESTDATA_BACKUP}" "${TESTDATA_DIR}"
-          echo "[TESTDATA] Restored current branch testdata"
+          # Restore original test code
+          rm -rf "${CLI_TEST_DIR}"
+          cp -r "${CLI_TEST_BACKUP}" "${CLI_TEST_DIR}"
+          echo "[TEST CODE] Restored current branch test code"
 
       - name: Upload test results
         if: always()
