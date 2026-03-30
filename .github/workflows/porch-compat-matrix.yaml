@@ -51,7 +51,7 @@ jobs:
         run: |
           # Always query upstream repo for releases (works correctly from forks)
           VERSIONS=$(gh api repos/${UPSTREAM_REPO}/releases \
-            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:3] | [.[].tag_name]')
+            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:2] | [.[].tag_name]')
           echo "versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
           echo "Resolved releases: ${VERSIONS}"
 
