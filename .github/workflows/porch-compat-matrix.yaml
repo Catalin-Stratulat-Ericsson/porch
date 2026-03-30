@@ -77,9 +77,12 @@ jobs:
     steps:
       # --- Step 1: Checkout the server version's source code ---
 
-      - name: Checkout current branch (latest)
+      - name: Checkout upstream latest (1.5 branch)
         if: matrix.server_version == 'latest'
         uses: actions/checkout@v4
+        with:
+          repository: nephio-project/porch
+          ref: '1.5'
 
       - name: Checkout upstream tag ${{ matrix.server_version }}
         if: matrix.server_version != 'latest'
