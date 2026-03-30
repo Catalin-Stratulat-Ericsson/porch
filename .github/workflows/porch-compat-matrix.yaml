@@ -25,16 +25,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_REPO: porch-kind
   KIND_CONTEXT_NAME: porch-test
-  PORCH_SERVER_IMAGE: porch-server
-  PORCH_CONTROLLERS_IMAGE: porch-controllers
-  PORCH_FUNCTION_RUNNER_IMAGE: porch-function-runner
-  PORCH_WRAPPER_SERVER_IMAGE: porch-wrapper-server
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Resolve the last 3 published releases and build the server matrix
+  # 1. Resolve the last 2 published releases and build the server matrix
   # ---------------------------------------------------------------------------
   resolve-versions:
     name: Resolve Versions
@@ -43,7 +38,7 @@ jobs:
       releases: ${{ steps.releases.outputs.versions }}
       server_matrix: ${{ steps.matrix.outputs.server_matrix }}
     steps:
-      - name: Get last 3 releases
+      - name: Get last 2 releases
         id: releases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,111 +54,53 @@ jobs:
         id: matrix
         run: |
           RELEASES='${{ steps.releases.outputs.versions }}'
-          # One runner per server version (latest + 3 releases)
           SERVER_MATRIX=$(echo "$RELEASES" | jq -c '{include: ([{server_version: "latest"}] + [.[] | {server_version: .}])}')
           echo "server_matrix=${SERVER_MATRIX}" >> "$GITHUB_OUTPUT"
           echo "Server matrix:"
           echo "$SERVER_MATRIX" | jq .
 
   # ---------------------------------------------------------------------------
-  # 2. Build the latest server images from the current branch
-  # ---------------------------------------------------------------------------
-  build-latest-server:
-    name: Build Latest Server Images
-    runs-on: ubuntu-latest
-    needs: resolve-versions
-    timeout-minutes: 15
-    env:
-      IMAGE_TAG: latest
-    steps:
-      - name: Checkout Porch
-        uses: actions/checkout@v4
-      - name: Set up Go
-        uses: ./.github/actions/setup-go-kpt
-        with:
-          install-kpt: "false"
-          go-cache: "true"
-      - name: Set build variables
-        id: vars
-        run: |
-          echo "alpine-version=$(make --eval='print: ; @echo $(ALPINE_VERSION)' print)" >> $GITHUB_OUTPUT
-          echo "golang-bookworm=$(make --eval='print: ; @echo $(GOLANG_BOOKWORM_VERSION)' print)" >> $GITHUB_OUTPUT
-          echo "golang-alpine=$(make --eval='print: ; @echo $(GOLANG_ALPINE_VERSION)' print)" >> $GITHUB_OUTPUT
-      - name: Build images
-        run: |
-          set -e
-          export ALPINE_VERSION=${{ steps.vars.outputs.alpine-version }}
-          export GOLANG_BOOKWORM_VERSION=${{ steps.vars.outputs.golang-bookworm }}
-          export GOLANG_ALPINE_VERSION=${{ steps.vars.outputs.golang-alpine }}
-          IMAGE_NAME=${PORCH_FUNCTION_RUNNER_IMAGE} WRAPPER_SERVER_IMAGE_NAME=${PORCH_WRAPPER_SERVER_IMAGE} make -C func/ build-image &
-          pid1=$!
-          IMAGE_NAME=${PORCH_SERVER_IMAGE} make -C build/ build-image &
-          pid2=$!
-          IMAGE_NAME=${PORCH_CONTROLLERS_IMAGE} make -C controllers/ build-image &
-          pid3=$!
-          wait $pid1 && wait $pid2 && wait $pid3
-      - name: Save images
-        run: |
-          docker save \
-            ${IMAGE_REPO}/${PORCH_SERVER_IMAGE}:${IMAGE_TAG} \
-            ${IMAGE_REPO}/${PORCH_CONTROLLERS_IMAGE}:${IMAGE_TAG} \
-            ${IMAGE_REPO}/${PORCH_FUNCTION_RUNNER_IMAGE}:${IMAGE_TAG} \
-            ${IMAGE_REPO}/${PORCH_WRAPPER_SERVER_IMAGE}:${IMAGE_TAG} \
-            | gzip > porch-images-latest.tar.gz
-      - name: Upload images
-        uses: actions/upload-artifact@v4
-        with:
-          name: porch-images-latest
-          path: porch-images-latest.tar.gz
-          compression-level: 0
-          retention-days: 1
-
-  # ---------------------------------------------------------------------------
-  # 3. Build the latest porchctl from the current branch
-  # ---------------------------------------------------------------------------
-  build-latest-cli:
-    name: Build Latest CLI
-    runs-on: ubuntu-latest
-    needs: resolve-versions
-    timeout-minutes: 10
-    steps:
-      - name: Checkout Porch
-        uses: actions/checkout@v4
-      - name: Set up Go
-        uses: ./.github/actions/setup-go-kpt
-        with:
-          install-kpt: "false"
-          go-cache: "true"
-      - name: Build porchctl
-        run: make porchctl
-      - name: Upload porchctl
-        uses: actions/upload-artifact@v4
-        with:
-          name: porchctl-latest
-          path: .build/porchctl
-          retention-days: 1
-
-  # ---------------------------------------------------------------------------
-  # 4. One runner per server version — tests all CLI versions sequentially
+  # 2. One self-contained runner per server version
+  #    Each runner: checks out the version source, builds & deploys from it,
+  #    then tests all CLI versions sequentially.
   # ---------------------------------------------------------------------------
   compat-test:
     name: "Server ${{ matrix.server_version }}"
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    needs: [resolve-versions, build-latest-server, build-latest-cli]
+    needs: resolve-versions
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.resolve-versions.outputs.server_matrix) }}
     env:
       RELEASES: ${{ needs.resolve-versions.outputs.releases }}
     steps:
-      - name: Checkout Porch
+      # --- Step 1: Checkout the server version's source code ---
+
+      - name: Checkout current branch (latest)
+        if: matrix.server_version == 'latest'
         uses: actions/checkout@v4
 
-      - name: Set up Go and kpt
-        uses: ./.github/actions/setup-go-kpt
+      - name: Checkout upstream tag ${{ matrix.server_version }}
+        if: matrix.server_version != 'latest'
+        uses: actions/checkout@v4
         with:
-          go-cache: "true"
+          repository: nephio-project/porch
+          ref: ${{ matrix.server_version }}
+
+      # --- Step 2: Setup tooling ---
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install kpt
+        run: |
+          KPT_VERSION=$(go list -m -f '{{.Version}}' github.com/kptdev/kpt 2>/dev/null || echo "v1.0.0-beta.61.1")
+          echo "Installing kpt ${KPT_VERSION}"
+          curl -fsSL "https://github.com/kptdev/kpt/releases/download/${KPT_VERSION}/kpt_linux_amd64-${KPT_VERSION#v}.tar.gz" | tar -xz -C /usr/local/bin/
 
       - name: Install Kind
         uses: helm/kind-action@v1
@@ -176,74 +113,26 @@ jobs:
           git config --global user.name "Porch Compat"
           git config --global user.email "porch-compat@porch.dev"
 
-      - name: Setup dev env (kind + gitea + MetalLB)
-        run: ${GITHUB_WORKSPACE}/scripts/setup-dev-env.sh
+      # --- Step 3: Setup dev env (kind + gitea + MetalLB + porchctl) ---
 
-      # --- Deploy the server (once per runner) ---
-
-      - name: Download latest server images
-        if: matrix.server_version == 'latest'
-        uses: actions/download-artifact@v4
-        with:
-          name: porch-images-latest
-      - name: Load and deploy latest server
-        if: matrix.server_version == 'latest'
+      - name: Setup dev env
         run: |
-          gunzip -c porch-images-latest.tar.gz | docker load
-          kind load docker-image ${IMAGE_REPO}/${PORCH_SERVER_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
-          kind load docker-image ${IMAGE_REPO}/${PORCH_CONTROLLERS_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
-          kind load docker-image ${IMAGE_REPO}/${PORCH_FUNCTION_RUNNER_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
-          kind load docker-image ${IMAGE_REPO}/${PORCH_WRAPPER_SERVER_IMAGE}:latest -n ${KIND_CONTEXT_NAME}
-          IMAGE_TAG=latest SKIP_IMG_BUILD=true SKIP_LOCAL_GIT=true \
-            PORCH_CACHE_TYPE=DB \
-            make deployment-config deploy-current-config
+          echo "=============================================="
+          echo "[SETUP] Setting up dev env for server ${{ matrix.server_version }}"
+          echo "=============================================="
+          ./scripts/setup-dev-env.sh
 
-      - name: Deploy released server ${{ matrix.server_version }}
-        if: matrix.server_version != 'latest'
-        env:
-          SERVER_VERSION: ${{ matrix.server_version }}
+      # --- Step 4: Build and deploy porch with DB cache ---
+
+      - name: Build and deploy porch (DB cache, no git server)
         run: |
-          set -e
-          DEPLOY_DIR="${GITHUB_WORKSPACE}/.build/deploy"
-          rm -rf "${DEPLOY_DIR}" || true
-          mkdir -p "${DEPLOY_DIR}"
+          echo "=============================================="
+          echo "[DEPLOY] Building and deploying porch server ${{ matrix.server_version }} with DB cache"
+          echo "=============================================="
+          make run-in-kind-db-cache-no-git
 
-          # Download and extract the release blueprint
-          UPSTREAM_REPO="nephio-project/porch"
-          BLUEPRINT_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${SERVER_VERSION}/porch_blueprint.tar.gz"
-          echo "Downloading blueprint from ${BLUEPRINT_URL}"
-          curl -fsSL "${BLUEPRINT_URL}" | tar -xz -C "${DEPLOY_DIR}"
+      # --- Step 5: Download all CLI binaries ---
 
-          # Pull server images from registry and load into kind
-          for IMG in porch-server porch-controllers porch-function-runner porch-wrapper-server; do
-            echo "Pulling docker.io/nephio/${IMG}:${SERVER_VERSION}"
-            docker pull "docker.io/nephio/${IMG}:${SERVER_VERSION}" || true
-            kind load docker-image "docker.io/nephio/${IMG}:${SERVER_VERSION}" -n ${KIND_CONTEXT_NAME} || true
-          done
-
-          # Configure DB cache
-          kpt fn eval "${DEPLOY_DIR}" \
-            --image ghcr.io/kptdev/krm-functions-catalog/search-replace:v0.2 \
-            --match-kind ConfigMap \
-            --match-name porch-config \
-            --match-namespace porch-system \
-            -- by-path=data.cache-type put-value="DB" || true
-
-          # Deploy using kpt
-          kpt live init "${DEPLOY_DIR}" --name porch --namespace porch-system --inventory-id nephio || true
-          kpt live apply --inventory-policy=adopt --server-side --force-conflicts "${DEPLOY_DIR}"
-          kubectl rollout status deployment function-runner --namespace porch-system --timeout=120s 2>/dev/null || true
-          kubectl rollout status deployment porch-controllers --namespace porch-system --timeout=120s 2>/dev/null || true
-          kubectl rollout status deployment porch-server --namespace porch-system --timeout=120s 2>/dev/null || true
-          echo "Server ${SERVER_VERSION} deployed with DB cache."
-
-      # --- Download all CLI versions ---
-
-      - name: Download latest CLI
-        uses: actions/download-artifact@v4
-        with:
-          name: porchctl-latest
-          path: .build/cli/latest/
       - name: Download released CLI versions
         run: |
           UPSTREAM_REPO="nephio-project/porch"
@@ -253,17 +142,20 @@ jobs:
             echo "Downloading porchctl ${VERSION} from ${CLI_URL}"
             mkdir -p ".build/cli/${VERSION}"
             curl -fsSL "${CLI_URL}" | tar -xz -C ".build/cli/${VERSION}/"
+            chmod +x ".build/cli/${VERSION}/porchctl"
           done
-      - name: Make all CLI binaries executable
-        run: |
-          find .build/cli -name porchctl -exec chmod +x {} \;
+
+          # Also save the locally built porchctl as "latest"
+          mkdir -p .build/cli/latest
+          cp .build/porchctl .build/cli/latest/porchctl
+
           echo "Available CLI versions:"
           for d in .build/cli/*/; do
             VERSION=$(basename "$d")
             echo "  ${VERSION}: $("${d}porchctl" version 2>/dev/null || echo 'version check skipped')"
           done
 
-      # --- Run CLI tests with each porchctl version sequentially ---
+      # --- Step 6: Run CLI tests with each porchctl version sequentially ---
 
       - name: Run CLI tests with all porchctl versions
         id: run-tests
@@ -271,64 +163,23 @@ jobs:
           set +e
           mkdir -p .build/compat-results
 
-          # Build list of CLI versions to test: latest + releases
           CLI_VERSIONS="latest $(echo "$RELEASES" | jq -r '.[]')"
-
-          # Back up the current branch's test/e2e/cli directory and .build/porchctl
-          CLI_TEST_DIR="${GITHUB_WORKSPACE}/test/e2e/cli"
-          CLI_TEST_BACKUP="${GITHUB_WORKSPACE}/.build/cli-test-backup"
-          cp -r "${CLI_TEST_DIR}" "${CLI_TEST_BACKUP}"
-          PORCHCTL_ORIGINAL="${GITHUB_WORKSPACE}/.build/porchctl"
-
-          UPSTREAM_REPO="nephio-project/porch"
 
           for CLI_VERSION in $CLI_VERSIONS; do
             echo ""
             echo "=============================================="
-            echo "Testing CLI ${CLI_VERSION} against server ${{ matrix.server_version }}"
+            echo "[TEST] CLI ${CLI_VERSION} against server ${{ matrix.server_version }}"
             echo "=============================================="
 
-            if [ "${CLI_VERSION}" = "latest" ]; then
-              # --- Latest: use current branch test code + PORCHCTL_PATH ---
-              echo "[TEST CODE] Using current branch test code (latest)"
-              rm -rf "${CLI_TEST_DIR}"
-              cp -r "${CLI_TEST_BACKUP}" "${CLI_TEST_DIR}"
+            # Swap the porchctl binary
+            cp "${GITHUB_WORKSPACE}/.build/cli/${CLI_VERSION}/porchctl" "${GITHUB_WORKSPACE}/.build/porchctl"
+            echo "[TEST] Using porchctl from ${CLI_VERSION}:"
+            .build/porchctl version 2>/dev/null || echo "  version check skipped"
 
-              PORCHCTL_BIN="${GITHUB_WORKSPACE}/.build/cli/${CLI_VERSION}/porchctl"
-              LOG_FILE=".build/compat-results/test-${CLI_VERSION}.log"
+            LOG_FILE=".build/compat-results/test-${CLI_VERSION}.log"
 
-              E2E=1 PORCHCTL_PATH="${PORCHCTL_BIN}" \
-                go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee "${LOG_FILE}"
-              TEST_EXIT=${PIPESTATUS[0]}
-            else
-              # --- Released version: swap entire test/e2e/cli from upstream tag ---
-              echo "[TEST CODE] Downloading test code from upstream tag ${CLI_VERSION}..."
-              TARBALL_URL="https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${CLI_VERSION}.tar.gz"
-              EXTRACT_DIR=$(mktemp -d)
-              curl -fsSL "${TARBALL_URL}" | tar -xz -C "${EXTRACT_DIR}"
-              VERSION_NUM="${CLI_VERSION#v}"
-              EXTRACTED_CLI_TEST="${EXTRACT_DIR}/porch-${VERSION_NUM}/test/e2e/cli"
-
-              if [ -d "${EXTRACTED_CLI_TEST}" ]; then
-                rm -rf "${CLI_TEST_DIR}"
-                cp -r "${EXTRACTED_CLI_TEST}" "${CLI_TEST_DIR}"
-                echo "[TEST CODE] Swapped to ${CLI_VERSION} test code + testdata"
-              else
-                echo "[TEST CODE] WARNING: Could not find test/e2e/cli in ${CLI_VERSION} source, falling back to current branch"
-                rm -rf "${CLI_TEST_DIR}"
-                cp -r "${CLI_TEST_BACKUP}" "${CLI_TEST_DIR}"
-              fi
-              rm -rf "${EXTRACT_DIR}"
-
-              # Copy the porchctl binary to .build/porchctl where the old harness expects it
-              cp "${GITHUB_WORKSPACE}/.build/cli/${CLI_VERSION}/porchctl" "${PORCHCTL_ORIGINAL}"
-              echo "[TEST CODE] Placed ${CLI_VERSION} porchctl at .build/porchctl"
-
-              LOG_FILE=".build/compat-results/test-${CLI_VERSION}.log"
-
-              E2E=1 go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee "${LOG_FILE}"
-              TEST_EXIT=${PIPESTATUS[0]}
-            fi
+            E2E=1 go test -v -timeout 20m ./test/e2e/cli 2>&1 | tee "${LOG_FILE}"
+            TEST_EXIT=${PIPESTATUS[0]}
 
             # Parse results
             RESULT="pass"
@@ -352,10 +203,7 @@ jobs:
             echo "Failed tests: ${FAILED_TESTS}"
           done
 
-          # Restore original test code
-          rm -rf "${CLI_TEST_DIR}"
-          cp -r "${CLI_TEST_BACKUP}" "${CLI_TEST_DIR}"
-          echo "[TEST CODE] Restored current branch test code"
+      # --- Step 7: Upload results + server logs ---
 
       - name: Upload test results
         if: always()
@@ -383,7 +231,7 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # 5. Aggregate results into a compatibility matrix summary
+  # 3. Aggregate results into a compatibility matrix summary
   # ---------------------------------------------------------------------------
   compat-summary:
     name: Compatibility Matrix Summary
