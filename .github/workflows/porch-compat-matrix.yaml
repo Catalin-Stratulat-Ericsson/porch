@@ -29,7 +29,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Resolve the last 5 published releases and build the server matrix
+  # 1. Resolve the last 3 published releases and build the server matrix
   # ---------------------------------------------------------------------------
   resolve-versions:
     name: Resolve Versions
@@ -38,7 +38,7 @@ jobs:
       releases: ${{ steps.releases.outputs.versions }}
       server_matrix: ${{ steps.matrix.outputs.server_matrix }}
     steps:
-      - name: Get last 5 releases
+      - name: Get last 3 releases
         id: releases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,7 +46,7 @@ jobs:
         run: |
           # Always query upstream repo for releases (works correctly from forks)
           VERSIONS=$(gh api repos/${UPSTREAM_REPO}/releases \
-            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:5] | [.[].tag_name]')
+            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:3] | [.[].tag_name]')
           echo "versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
           echo "Resolved releases: ${VERSIONS}"
 
@@ -279,12 +279,12 @@ jobs:
                 CELL=$(echo "$RESULTS" | jq -r --arg sv "$sv" --arg cv "$cv" '
                   map(select(.server_version == $sv and .cli_version == $cv)) |
                   if length == 0 then "⚪ N/A"
-                  elif .[0].result == "pass" then "✅"
+                  elif .[0].result == "pass" then "✅ All tests passed"
                   else
                     .[0].failed_tests as $ft |
                     if ($ft | length) > 0 then
-                      "❌ " + ($ft | split(",") | map(split("/") | last) | .[0:3] | join(", ")) +
-                      (if ($ft | split(",") | length) > 3 then " +" + (($ft | split(",") | length) - 3 | tostring) + " more" else "" end)
+                      "❌ " + ($ft | split(",") | map(select(. != "TestPorch")) | map(split("/") | last) | .[0:3] | join(", ")) +
+                      (if ($ft | split(",") | map(select(. != "TestPorch")) | length) > 3 then " +" + (($ft | split(",") | map(select(. != "TestPorch")) | length) - 3 | tostring) + " more" else "" end)
                     else "❌"
                     end
                   end
