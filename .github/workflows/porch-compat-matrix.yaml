@@ -29,7 +29,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Resolve the last 3 published releases and build the server matrix
+  # 1. Resolve the last 4 published releases and build the server matrix
   # ---------------------------------------------------------------------------
   resolve-versions:
     name: Resolve Versions
@@ -38,7 +38,7 @@ jobs:
       releases: ${{ steps.releases.outputs.versions }}
       server_matrix: ${{ steps.matrix.outputs.server_matrix }}
     steps:
-      - name: Get last 3 releases
+      - name: Get last 4 releases
         id: releases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,7 +46,7 @@ jobs:
         run: |
           # Always query upstream repo for releases (works correctly from forks)
           VERSIONS=$(gh api repos/${UPSTREAM_REPO}/releases \
-            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:3] | [.[].tag_name]')
+            --jq '[.[] | select(.draft == false)] | sort_by(.published_at) | reverse | .[0:4] | [.[].tag_name]')
           echo "versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
           echo "Resolved releases: ${VERSIONS}"
 
@@ -60,7 +60,7 @@ jobs:
           echo "$SERVER_MATRIX" | jq .
 
   # ---------------------------------------------------------------------------
-  # 2. One self-contained runner per server version
+  # 2. One self-contained runner per porch server version
   #    Each runner: checks out the version source, builds & deploys from it,
   #    then tests all CLI versions sequentially.
   # ---------------------------------------------------------------------------
@@ -104,6 +104,9 @@ jobs:
           KPT_VERSION=$(go list -m -f '{{.Version}}' github.com/kptdev/kpt 2>/dev/null || echo "v1.0.0-beta.61.1")
           echo "Installing kpt ${KPT_VERSION}"
           curl -fsSL "https://github.com/kptdev/kpt/releases/download/${KPT_VERSION}/kpt_linux_amd64-${KPT_VERSION#v}.tar.gz" | tar -xz -C /usr/local/bin/
+          # Save kpt version for result reporting
+          mkdir -p .build
+          echo "${KPT_VERSION}" > .build/kpt-version.txt
 
       - name: Install Kind
         uses: helm/kind-action@v1
@@ -197,6 +200,7 @@ jobs:
           {
             "server_version": "${{ matrix.server_version }}",
             "cli_version": "${CLI_VERSION}",
+            "kpt_version": "$(cat .build/kpt-version.txt 2>/dev/null || echo 'unknown')",
             "result": "${RESULT}",
             "failed_tests": "${FAILED_TESTS}"
           }
@@ -274,7 +278,11 @@ jobs:
             echo "$SEP"
 
             for sv in $SERVER_VERSIONS; do
-              ROW="| ${sv} |"
+              # Extract kpt version for this server from any of its results
+              KPT_VER=$(echo "$RESULTS" | jq -r --arg sv "$sv" '
+                map(select(.server_version == $sv)) | .[0].kpt_version // "unknown"
+              ')
+              ROW="| ${sv} (kpt ${KPT_VER}) |"
               for cv in $CLI_VERSIONS; do
                 CELL=$(echo "$RESULTS" | jq -r --arg sv "$sv" --arg cv "$cv" '
                   map(select(.server_version == $sv and .cli_version == $cv)) |
