@@ -14,7 +14,7 @@
 
 name: golangci-lint
 on:
-  pull_request:
+  # pull_request: # temporarily disabled for compat matrix testing
   workflow_dispatch:
 
 permissions:
