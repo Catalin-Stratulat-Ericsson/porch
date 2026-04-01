@@ -99,14 +99,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # --- Install's kpt based on porch go.mod native version ---
+
       - name: Install kpt
         run: |
-          KPT_VERSION=$(go list -m -f '{{.Version}}' github.com/kptdev/kpt 2>/dev/null || echo "v1.0.0-beta.61.1")
+          KPT_VERSION=$(go list -m -f '{{.Version}}' github.com/kptdev/kpt 2>/dev/null)
+          if [ -z "${KPT_VERSION}" ]; then
+            echo "::error::Failed to resolve kpt version from go.mod. Cannot proceed with tests."
+            exit 1
+          fi
           echo "Installing kpt ${KPT_VERSION}"
           curl -fsSL "https://github.com/kptdev/kpt/releases/download/${KPT_VERSION}/kpt_linux_amd64-${KPT_VERSION#v}.tar.gz" | tar -xz -C /usr/local/bin/
           # Save kpt version for result reporting
           mkdir -p .build
           echo "${KPT_VERSION}" > .build/kpt-version.txt
+
+      # --- Install's Kind without deploying a cluster ---
 
       - name: Install Kind
         uses: helm/kind-action@v1
@@ -137,7 +145,7 @@ jobs:
           echo "=============================================="
           make run-in-kind-db-cache-no-git
 
-      # --- Step 5: Download all CLI binaries ---
+      # --- Step 5: Download the CLI binaries ---
 
       - name: Download released CLI versions
         run: |
@@ -306,6 +314,9 @@ jobs:
             echo "- ✅ = All CLI tests passed"
             echo "- ❌ = One or more tests failed (failed test names shown)"
             echo "- ⚪ = Test did not run"
+            echo ""
+            echo "**Note:** Tests are run using the native kpt version for each porch server release (shown in parentheses)."
+            echo "This version is resolved from the go.mod file of each server version. Results may differ if a different kpt version is used."
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Check for failures
